@@ -3,45 +3,46 @@ const app = express();
 
 app.use(express.json());
 
-// Secret Admin Key (Aapka Admin Password)
 const ADMIN_SECRET = "Devil7029";
+const keysDatabase = {}; // In-Memory Store
 
-// In-Memory Database
-const keysDatabase = {};
-
-// 1. Script Access Check & Active Status Update
-app.get('/v1/check-access', (req, res) => {
-    const userKey = req.query.key;
-    const userHwid = req.query.hwid;
+// 1. Verification Endpoint (GG Script & Loader ke liye)
+app.all('/v1/verify-key', (req, res) => {
+    const userKey = req.body?.key || req.query?.key;
+    const userHwid = req.body?.hwid || req.query?.hwid || "N/A";
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-    if (!keysDatabase[userKey]) {
-        return res.json({ status: "UNAUTHORIZED", message: "Invalid Key!" });
+    if (!userKey || !keysDatabase[userKey]) {
+        return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
     }
 
     const keyData = keysDatabase[userKey];
 
+    // Check Ban Status
     if (keyData.isBanned) {
-        return res.json({ status: "BANNED", message: "Aapka account ban hai!" });
+        return res.json({ valid: false, status: "BANNED", message: "Aapka account ban hai!" });
+    }
+
+    // Check 24 Hours Expiry
+    if (Date.now() > keyData.expiresAt) {
+        return res.json({ valid: false, status: "EXPIRED", message: "Key Expired!" });
     }
 
     // HWID Binding
-    if (!keyData.boundHwid) {
+    if (!keyData.boundHwid && userHwid !== "N/A") {
         keyData.boundHwid = userHwid;
         keyData.boundIp = clientIp;
-    } else if (keyData.boundHwid !== userHwid) {
-        return res.json({ status: "UNAUTHORIZED", message: "Key kisi aur device par active hai!" });
+    } else if (keyData.boundHwid && userHwid !== "N/A" && keyData.boundHwid !== userHwid) {
+        return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key kisi aur device par active hai!" });
     }
 
-    // Real-Time Activity Update (Last Seen Time update ho gi)
     keyData.lastSeen = Date.now();
-
-    return res.json({ status: "AUTHORIZED", message: "Access Granted!" });
+    return res.json({ valid: true, status: "AUTHORIZED", message: "Access Granted!" });
 });
 
-// 2. Generate Key Endpoint (Discord Bot)
+// 2. Generate Key Endpoint (Discord Bot ke liye)
 app.post('/v1/generate-key', (req, res) => {
-    const { discordId, key } = req.body;
+    const { discordId, key, expiresAt } = req.body;
 
     if (!discordId || !key) return res.status(400).json({ error: "Missing fields" });
 
@@ -51,6 +52,7 @@ app.post('/v1/generate-key', (req, res) => {
         boundIp: null,
         isBanned: false,
         createdAt: Date.now(),
+        expiresAt: expiresAt || (Date.now() + (24 * 60 * 60 * 1000)),
         lastSeen: null
     };
 
@@ -62,7 +64,7 @@ app.post('/v1/admin/ban', (req, res) => {
     const { adminSecret, key } = req.body;
 
     if (adminSecret !== ADMIN_SECRET) {
-        return res.status(403).json({ error: "Unauthorized! Invalid Admin Secret." });
+        return res.status(403).json({ error: "Unauthorized!" });
     }
 
     if (!keysDatabase[key]) return res.status(404).json({ error: "Key not found!" });
@@ -76,7 +78,7 @@ app.post('/v1/admin/unban', (req, res) => {
     const { adminSecret, key } = req.body;
 
     if (adminSecret !== ADMIN_SECRET) {
-        return res.status(403).json({ error: "Unauthorized! Invalid Admin Secret." });
+        return res.status(403).json({ error: "Unauthorized!" });
     }
 
     if (!keysDatabase[key]) return res.status(404).json({ error: "Key not found!" });
@@ -85,7 +87,7 @@ app.post('/v1/admin/unban', (req, res) => {
     return res.json({ success: true, message: `Key ${key} has been UNBANNED!` });
 });
 
-// 5. Real-Time Stats (Online Users + Discord ID + Key Details)
+// 5. Real-Time Admin Stats
 app.get('/v1/admin/stats', (req, res) => {
     const { adminSecret } = req.query;
 
@@ -94,7 +96,7 @@ app.get('/v1/admin/stats', (req, res) => {
     }
 
     const currentTime = Date.now();
-    const activeWindow = 5 * 60 * 1000; // 5 Minutes Window
+    const activeWindow = 5 * 60 * 1000;
 
     let totalKeys = 0;
     let bannedKeys = 0;
@@ -105,11 +107,8 @@ app.get('/v1/admin/stats', (req, res) => {
         totalKeys++;
         const item = keysDatabase[key];
 
-        if (item.isBanned) {
-            bannedKeys++;
-        }
+        if (item.isBanned) bannedKeys++;
 
-        // Check agar user ne pichle 5 minutes mein request bheji hai
         if (item.lastSeen && (currentTime - item.lastSeen <= activeWindow)) {
             onlineUsersCount++;
             onlineUsersList.push({
@@ -129,3 +128,4 @@ app.get('/v1/admin/stats', (req, res) => {
 });
 
 module.exports = app;
+    

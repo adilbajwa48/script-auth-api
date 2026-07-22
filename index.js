@@ -5,11 +5,17 @@ app.use(express.json());
 
 const ADMIN_SECRET = "Devil7029";
 const keysDatabase = {};
+const bannedIps = new Set(); // Banned IPs ki list
 
 app.all('/v1/verify-key', (req, res) => {
     const userKey = req.body?.key || req.query?.key;
     const userHwid = req.body?.hwid || req.query?.hwid || "N/A";
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+    // Check if IP is permanently BANNED
+    if (bannedIps.has(clientIp)) {
+        return res.json({ valid: false, status: "BANNED", message: "Your IP address is permanently banned!" });
+    }
 
     if (!userKey || !keysDatabase[userKey]) {
         return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
@@ -55,22 +61,38 @@ app.post('/v1/generate-key', (req, res) => {
     return res.json({ success: true, message: "Key created successfully!" });
 });
 
-app.post('/v1/admin/ban', (req, res) => {
-    const { adminSecret, key } = req.body;
+// BAN IP ENDPOINT
+app.post('/v1/admin/ban-ip', (req, res) => {
+    const { adminSecret, discordId, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
-    if (!keysDatabase[key]) return res.status(404).json({ error: "Key not found!" });
 
-    keysDatabase[key].isBanned = true;
-    return res.json({ success: true, message: `Key ${key} has been BANNED!` });
+    let targetIp = ip;
+
+    // Agar IP nahi di lekin Discord ID di hai, to database se uski IP dhoondo
+    if (!targetIp && discordId) {
+        for (const k in keysDatabase) {
+            if (keysDatabase[k].discordId === discordId && keysDatabase[k].boundIp) {
+                targetIp = keysDatabase[k].boundIp;
+                break;
+            }
+        }
+    }
+
+    if (!targetIp) {
+        return res.status(404).json({ error: "User IP not found! User needs to login at least once." });
+    }
+
+    bannedIps.add(targetIp);
+    return res.json({ success: true, message: `IP ${targetIp} has been BANNED!`, bannedIp: targetIp });
 });
 
-app.post('/v1/admin/unban', (req, res) => {
-    const { adminSecret, key } = req.body;
+// UNBAN IP ENDPOINT
+app.post('/v1/admin/unban-ip', (req, res) => {
+    const { adminSecret, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
-    if (!keysDatabase[key]) return res.status(404).json({ error: "Key not found!" });
 
-    keysDatabase[key].isBanned = false;
-    return res.json({ success: true, message: `Key ${key} has been UNBANNED!` });
+    bannedIps.delete(ip);
+    return res.json({ success: true, message: `IP ${ip} has been UNBANNED!` });
 });
 
 app.get('/v1/admin/stats', (req, res) => {
@@ -100,8 +122,10 @@ app.get('/v1/admin/stats', (req, res) => {
         totalKeys: totalKeys,
         bannedKeys: bannedKeys,
         onlineUsersCount: onlineUsersCount,
-        onlineUsersList: onlineUsersList
+        onlineUsersList: onlineUsersList,
+        bannedIpsCount: bannedIps.size
     });
 });
 
 module.exports = app;
+            

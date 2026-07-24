@@ -7,6 +7,33 @@ const ADMIN_SECRET = "Devil7029";
 const keysDatabase = {};
 const bannedIps = new Set(); // Banned IPs ki list
 
+// 1. CHECK ACTIVE KEY (Is endpoint ki waja se har bar new key ban rahi thi)
+app.get('/v1/check-key', (req, res) => {
+    const discordId = req.query.discordId;
+
+    if (!discordId) {
+        return res.status(400).json({ error: "Missing discordId" });
+    }
+
+    const currentTime = Date.now();
+
+    // Database mein check karein ke is Discord user ki active key mojood hai ya nahi
+    for (const key in keysDatabase) {
+        const item = keysDatabase[key];
+        if (item.discordId === discordId && item.expiresAt > currentTime && !item.isBanned) {
+            return res.json({
+                active: true,
+                key: key,
+                expiresAt: item.expiresAt,
+                boundIp: item.boundIp || null
+            });
+        }
+    }
+
+    return res.status(404).json({ active: false, message: "No active key found" });
+});
+
+// 2. VERIFY KEY (Script access verification)
 app.all('/v1/verify-key', (req, res) => {
     const userKey = req.body?.key || req.query?.key;
     const userHwid = req.body?.hwid || req.query?.hwid || "N/A";
@@ -43,10 +70,18 @@ app.all('/v1/verify-key', (req, res) => {
     return res.json({ valid: true, status: "AUTHORIZED", message: "Access Granted!" });
 });
 
+// 3. GENERATE KEY (Discord bot creates key)
 app.post('/v1/generate-key', (req, res) => {
     const { discordId, key, expiresAt } = req.body;
 
     if (!discordId || !key) return res.status(400).json({ error: "Missing fields" });
+
+    // Old key cleanup for same Discord ID
+    for (const k in keysDatabase) {
+        if (keysDatabase[k].discordId === discordId) {
+            delete keysDatabase[k];
+        }
+    }
 
     keysDatabase[key] = {
         discordId: discordId,
@@ -61,7 +96,7 @@ app.post('/v1/generate-key', (req, res) => {
     return res.json({ success: true, message: "Key created successfully!" });
 });
 
-// BAN IP ENDPOINT
+// 4. BAN IP ENDPOINT
 app.post('/v1/admin/ban-ip', (req, res) => {
     const { adminSecret, discordId, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
@@ -86,7 +121,7 @@ app.post('/v1/admin/ban-ip', (req, res) => {
     return res.json({ success: true, message: `IP ${targetIp} has been BANNED!`, bannedIp: targetIp });
 });
 
-// UNBAN IP ENDPOINT
+// 5. UNBAN IP ENDPOINT
 app.post('/v1/admin/unban-ip', (req, res) => {
     const { adminSecret, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
@@ -95,6 +130,7 @@ app.post('/v1/admin/unban-ip', (req, res) => {
     return res.json({ success: true, message: `IP ${ip} has been UNBANNED!` });
 });
 
+// 6. ADMIN STATS
 app.get('/v1/admin/stats', (req, res) => {
     const { adminSecret } = req.query;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
@@ -128,4 +164,3 @@ app.get('/v1/admin/stats', (req, res) => {
 });
 
 module.exports = app;
-            

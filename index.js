@@ -7,13 +7,13 @@ app.use(express.urlencoded({ extended: true }));
 
 const ADMIN_SECRET = "Devil7029";
 
-// Railway Database Connection
+// Railway Postgres Database Connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// Create Database Tables Automatically
+// Database Tables Automatic Setup
 async function initTables() {
     try {
         await pool.query(`
@@ -31,14 +31,14 @@ async function initTables() {
                 ip VARCHAR(50) PRIMARY KEY
             );
         `);
-        console.log("✅ Railway Postgres Connected & Ready!");
+        console.log("✅ Database Connected & Tables Configured!");
     } catch (err) {
         console.error("❌ DB Init Error:", err);
     }
 }
 initTables();
 
-// Enhanced Real IP Extractor for Vercel Serverless
+// Get Client IP Helper
 function getClientIp(req) {
     const forwarded = req.headers['x-forwarded-for'] || req.headers['x-real-ip'];
     if (forwarded) {
@@ -75,11 +75,11 @@ app.get('/v1/check-key', async (req, res) => {
     }
 });
 
-// 2. VERIFY KEY (Script Verification in GG/Executors)
+// 2. VERIFY KEY (Script Execution - 24 Hours & Single Device Lock)
 app.all('/v1/verify-key', async (req, res) => {
     const rawKey = req.body?.key || req.query?.key || req.headers['x-key-auth'];
     const rawHwid = req.body?.hwid || req.query?.hwid || "N/A";
-    
+
     if (!rawKey) {
         return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
     }
@@ -95,14 +95,15 @@ app.all('/v1/verify-key', async (req, res) => {
             return res.json({ valid: false, status: "BANNED", message: "Your IP address is permanently banned!" });
         }
 
-        // Fetch Key
+        // Fetch Key from Database
         const keyRes = await pool.query(`SELECT * FROM keys WHERE TRIM(key) = $1`, [userKey]);
         if (keyRes.rows.length === 0) {
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid or Expired Key!" });
+            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
         }
 
         const keyData = keyRes.rows[0];
 
+        // Check if Key is Banned
         if (keyData.is_banned) {
             return res.json({ valid: false, status: "BANNED", message: "Account banned!" });
         }
@@ -110,24 +111,25 @@ app.all('/v1/verify-key', async (req, res) => {
         const currentTime = Date.now();
         const expiresAt = Number(keyData.expires_at);
 
-        if (currentTime > expiresAt) {
+        // Check Expiration (Full 24 Hours check)
+        if (currentTime >= expiresAt) {
             return res.json({ valid: false, status: "EXPIRED", message: "Key Expired!" });
         }
 
-        // IP Binding & Lock Check
+        // Single Device (IP) Binding & Lock Check
         if (!keyData.bound_ip) {
-            // First time use -> Bind user IP & HWID
+            // First Time Use -> Bind key to this Device IP permanently for 24 hours
             await pool.query(
-                `UPDATE keys SET bound_ip = $1, bound_hwid = $2, last_seen = $3 WHERE TRIM(key) = $4`, 
+                `UPDATE keys SET bound_ip = $1, bound_hwid = $2, last_seen = $3 WHERE TRIM(key) = $4`,
                 [clientIp, userHwid, currentTime, userKey]
             );
         } else if (keyData.bound_ip !== clientIp) {
-            // IP Mismatch -> Lock Error
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key locked to another IP!" });
+            // Un-authorized Device trying to use same Key
+            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key is bound to another device!" });
         } else {
-            // Valid IP -> Update Last Seen
+            // Same Device -> Update last activity
             await pool.query(
-                `UPDATE keys SET last_seen = $1 WHERE TRIM(key) = $2`, 
+                `UPDATE keys SET last_seen = $1 WHERE TRIM(key) = $2`,
                 [currentTime, userKey]
             );
         }
@@ -139,24 +141,32 @@ app.all('/v1/verify-key', async (req, res) => {
     }
 });
 
-// 3. GENERATE KEY (Discord Bot)
+// 3. GENERATE KEY (Discord Bot - Auto 24 Hours Expiry Guarantee)
 app.post('/v1/generate-key', async (req, res) => {
     const { discordId, key, expiresAt } = req.body;
     if (!discordId || !key) return res.status(400).json({ error: "Missing fields" });
 
     const cleanDiscordId = String(discordId).trim();
     const cleanKey = String(key).trim();
-    const expTime = Number(expiresAt) || (Date.now() + (24 * 60 * 60 * 1000));
+    const now = Date.now();
+
+    // Force exact 24 Hours (86,400,000 ms) Expiration from current time
+    let expTime = Number(expiresAt);
+    if (!expTime || isNaN(expTime) || expTime <= now) {
+        expTime = now + (24 * 60 * 60 * 1000); // 24 Hours
+    }
 
     try {
+        // Delete old keys of this Discord User
         await pool.query(`DELETE FROM keys WHERE discord_id = $1`, [cleanDiscordId]);
 
+        // Save new Key with 24h Expiry
         await pool.query(
             `INSERT INTO keys (key, discord_id, expires_at, created_at) VALUES ($1, $2, $3, $4)`,
-            [cleanKey, cleanDiscordId, expTime, Date.now()]
+            [cleanKey, cleanDiscordId, expTime, now]
         );
 
-        return res.json({ success: true, message: "Key created successfully!" });
+        return res.json({ success: true, message: "Key generated with 24h validity!" });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
@@ -220,3 +230,4 @@ app.get('/v1/admin/stats', async (req, res) => {
 });
 
 module.exports = app;
+

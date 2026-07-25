@@ -7,7 +7,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const ADMIN_SECRET = "Devil7029";
 
-// Railway Postgres Database Connection
+// Railway Database Connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
@@ -31,14 +31,14 @@ async function initTables() {
                 ip VARCHAR(50) PRIMARY KEY
             );
         `);
-        console.log("✅ Database Connected & Tables Configured!");
+        console.log("✅ Database Connected & Tables Ready!");
     } catch (err) {
         console.error("❌ DB Init Error:", err);
     }
 }
 initTables();
 
-// Get Client IP Helper
+// Extract Clean IP
 function getClientIp(req) {
     const forwarded = req.headers['x-forwarded-for'] || req.headers['x-real-ip'];
     if (forwarded) {
@@ -75,10 +75,10 @@ app.get('/v1/check-key', async (req, res) => {
     }
 });
 
-// 2. VERIFY KEY (Script Execution - 24 Hours & Single Device Lock)
+// 2. VERIFY KEY (Script Execution - HWID & IP Binding)
 app.all('/v1/verify-key', async (req, res) => {
     const rawKey = req.body?.key || req.query?.key || req.headers['x-key-auth'];
-    const rawHwid = req.body?.hwid || req.query?.hwid || "N/A";
+    const rawHwid = req.body?.hwid || req.query?.hwid || "DEFAULT_HWID";
 
     if (!rawKey) {
         return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
@@ -92,45 +92,45 @@ app.all('/v1/verify-key', async (req, res) => {
         // Check Banned IP
         const bannedCheck = await pool.query(`SELECT * FROM banned_ips WHERE ip = $1`, [clientIp]);
         if (bannedCheck.rows.length > 0) {
-            return res.json({ valid: false, status: "BANNED", message: "Your IP address is permanently banned!" });
+            return res.json({ valid: false, status: "BANNED", message: "Your IP is permanently banned!" });
         }
 
-        // Fetch Key from Database
+        // Search Key in Database
         const keyRes = await pool.query(`SELECT * FROM keys WHERE TRIM(key) = $1`, [userKey]);
         if (keyRes.rows.length === 0) {
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
+            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid or Expired Key!" });
         }
 
         const keyData = keyRes.rows[0];
 
-        // Check if Key is Banned
+        // Ban check
         if (keyData.is_banned) {
-            return res.json({ valid: false, status: "BANNED", message: "Account banned!" });
+            return res.json({ valid: false, status: "BANNED", message: "Account Banned!" });
         }
 
         const currentTime = Date.now();
         const expiresAt = Number(keyData.expires_at);
 
-        // Check Expiration (Full 24 Hours check)
+        // Expiry Check
         if (currentTime >= expiresAt) {
-            return res.json({ valid: false, status: "EXPIRED", message: "Key Expired!" });
+            return res.json({ valid: false, status: "EXPIRED", message: "Key Expired! Please get a new key." });
         }
 
-        // Single Device (IP) Binding & Lock Check
-        if (!keyData.bound_ip) {
-            // First Time Use -> Bind key to this Device IP permanently for 24 hours
+        // Single Device Security (Prefers HWID if provided, falls back to IP)
+        if (!keyData.bound_hwid || keyData.bound_hwid === "DEFAULT_HWID") {
+            // Bind on first run
             await pool.query(
                 `UPDATE keys SET bound_ip = $1, bound_hwid = $2, last_seen = $3 WHERE TRIM(key) = $4`,
                 [clientIp, userHwid, currentTime, userKey]
             );
-        } else if (keyData.bound_ip !== clientIp) {
-            // Un-authorized Device trying to use same Key
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key is bound to another device!" });
+        } else if (userHwid !== "DEFAULT_HWID" && keyData.bound_hwid !== userHwid) {
+            // Blocked if used on another device HWID
+            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key is locked to another device!" });
         } else {
-            // Same Device -> Update last activity
+            // Update last seen & IP
             await pool.query(
-                `UPDATE keys SET last_seen = $1 WHERE TRIM(key) = $2`,
-                [currentTime, userKey]
+                `UPDATE keys SET bound_ip = $1, last_seen = $2 WHERE TRIM(key) = $3`,
+                [clientIp, currentTime, userKey]
             );
         }
 
@@ -141,7 +141,7 @@ app.all('/v1/verify-key', async (req, res) => {
     }
 });
 
-// 3. GENERATE KEY (Discord Bot - Auto 24 Hours Expiry Guarantee)
+// 3. GENERATE KEY (Discord Bot)
 app.post('/v1/generate-key', async (req, res) => {
     const { discordId, key, expiresAt } = req.body;
     if (!discordId || !key) return res.status(400).json({ error: "Missing fields" });
@@ -150,23 +150,21 @@ app.post('/v1/generate-key', async (req, res) => {
     const cleanKey = String(key).trim();
     const now = Date.now();
 
-    // Force exact 24 Hours (86,400,000 ms) Expiration from current time
+    // Exact 24 Hours validity
     let expTime = Number(expiresAt);
     if (!expTime || isNaN(expTime) || expTime <= now) {
-        expTime = now + (24 * 60 * 60 * 1000); // 24 Hours
+        expTime = now + (24 * 60 * 60 * 1000);
     }
 
     try {
-        // Delete old keys of this Discord User
         await pool.query(`DELETE FROM keys WHERE discord_id = $1`, [cleanDiscordId]);
 
-        // Save new Key with 24h Expiry
         await pool.query(
             `INSERT INTO keys (key, discord_id, expires_at, created_at) VALUES ($1, $2, $3, $4)`,
             [cleanKey, cleanDiscordId, expTime, now]
         );
 
-        return res.json({ success: true, message: "Key generated with 24h validity!" });
+        return res.json({ success: true, message: "Key created successfully!" });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
@@ -188,7 +186,7 @@ app.post('/v1/admin/ban-ip', async (req, res) => {
         if (!targetIp) return res.status(404).json({ error: "User IP not found!" });
 
         await pool.query(`INSERT INTO banned_ips (ip) VALUES ($1) ON CONFLICT DO NOTHING`, [targetIp]);
-        return res.json({ success: true, message: `IP ${targetIp} has been BANNED!`, bannedIp: targetIp });
+        return res.json({ success: true, message: `IP ${targetIp} BANNED!`, bannedIp: targetIp });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
@@ -201,7 +199,7 @@ app.post('/v1/admin/unban-ip', async (req, res) => {
 
     try {
         await pool.query(`DELETE FROM banned_ips WHERE ip = $1`, [ip]);
-        return res.json({ success: true, message: `IP ${ip} has been UNBANNED!` });
+        return res.json({ success: true, message: `IP ${ip} UNBANNED!` });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
@@ -230,4 +228,4 @@ app.get('/v1/admin/stats', async (req, res) => {
 });
 
 module.exports = app;
-
+    

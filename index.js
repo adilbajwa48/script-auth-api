@@ -13,7 +13,7 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Database Tables Automatic Setup
+// Database Setup
 async function initTables() {
     try {
         await pool.query(`
@@ -31,23 +31,20 @@ async function initTables() {
                 ip VARCHAR(50) PRIMARY KEY
             );
         `);
-        console.log("✅ Database Connected & Tables Ready!");
+        console.log("✅ Database Ready!");
     } catch (err) {
-        console.error("❌ DB Init Error:", err);
+        console.error("❌ DB Error:", err);
     }
 }
 initTables();
 
-// Extract Clean IP
 function getClientIp(req) {
     const forwarded = req.headers['x-forwarded-for'] || req.headers['x-real-ip'];
-    if (forwarded) {
-        return forwarded.split(',')[0].trim();
-    }
+    if (forwarded) return forwarded.split(',')[0].trim();
     return req.socket?.remoteAddress || req.ip || "0.0.0.0";
 }
 
-// 1. CHECK ACTIVE KEY (Discord Bot)
+// 1. CHECK ACTIVE KEY
 app.get('/v1/check-key', async (req, res) => {
     const discordId = req.query.discordId ? String(req.query.discordId).trim() : null;
     if (!discordId) return res.status(400).json({ error: "Missing discordId" });
@@ -68,66 +65,46 @@ app.get('/v1/check-key', async (req, res) => {
                 boundIp: activeKey.bound_ip || null
             });
         }
-
         return res.status(404).json({ active: false, message: "No active key found" });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
 });
 
-// 2. VERIFY KEY (Script Execution - HWID & IP Binding)
+// 2. VERIFY KEY
 app.all('/v1/verify-key', async (req, res) => {
     const rawKey = req.body?.key || req.query?.key || req.headers['x-key-auth'];
     const rawHwid = req.body?.hwid || req.query?.hwid || "DEFAULT_HWID";
 
-    if (!rawKey) {
-        return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
-    }
+    if (!rawKey) return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
 
     const userKey = String(rawKey).trim();
     const userHwid = String(rawHwid).trim();
     const clientIp = getClientIp(req);
 
     try {
-        // Check Banned IP
         const bannedCheck = await pool.query(`SELECT * FROM banned_ips WHERE ip = $1`, [clientIp]);
-        if (bannedCheck.rows.length > 0) {
-            return res.json({ valid: false, status: "BANNED", message: "Your IP is permanently banned!" });
-        }
+        if (bannedCheck.rows.length > 0) return res.json({ valid: false, status: "BANNED", message: "IP Banned!" });
 
-        // Search Key in Database
         const keyRes = await pool.query(`SELECT * FROM keys WHERE TRIM(key) = $1`, [userKey]);
-        if (keyRes.rows.length === 0) {
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid or Expired Key!" });
-        }
+        if (keyRes.rows.length === 0) return res.json({ valid: false, status: "UNAUTHORIZED", message: "Invalid Key!" });
 
         const keyData = keyRes.rows[0];
-
-        // Ban check
-        if (keyData.is_banned) {
-            return res.json({ valid: false, status: "BANNED", message: "Account Banned!" });
-        }
+        if (keyData.is_banned) return res.json({ valid: false, status: "BANNED", message: "Account Banned!" });
 
         const currentTime = Date.now();
-        const expiresAt = Number(keyData.expires_at);
-
-        // Expiry Check
-        if (currentTime >= expiresAt) {
-            return res.json({ valid: false, status: "EXPIRED", message: "Key Expired! Please get a new key." });
+        if (currentTime >= Number(keyData.expires_at)) {
+            return res.json({ valid: false, status: "EXPIRED", message: "Key Expired!" });
         }
 
-        // Single Device Security (Prefers HWID if provided, falls back to IP)
         if (!keyData.bound_hwid || keyData.bound_hwid === "DEFAULT_HWID") {
-            // Bind on first run
             await pool.query(
                 `UPDATE keys SET bound_ip = $1, bound_hwid = $2, last_seen = $3 WHERE TRIM(key) = $4`,
                 [clientIp, userHwid, currentTime, userKey]
             );
         } else if (userHwid !== "DEFAULT_HWID" && keyData.bound_hwid !== userHwid) {
-            // Blocked if used on another device HWID
-            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Key is locked to another device!" });
+            return res.json({ valid: false, status: "UNAUTHORIZED", message: "Locked to another device!" });
         } else {
-            // Update last seen & IP
             await pool.query(
                 `UPDATE keys SET bound_ip = $1, last_seen = $2 WHERE TRIM(key) = $3`,
                 [clientIp, currentTime, userKey]
@@ -136,12 +113,11 @@ app.all('/v1/verify-key', async (req, res) => {
 
         return res.json({ valid: true, status: "AUTHORIZED", message: "Access Granted!" });
     } catch (err) {
-        console.error("Verify Error:", err);
         return res.status(500).json({ error: "Database Server Error" });
     }
 });
 
-// 3. GENERATE KEY (Discord Bot)
+// 3. GENERATE KEY
 app.post('/v1/generate-key', async (req, res) => {
     const { discordId, key, expiresAt } = req.body;
     if (!discordId || !key) return res.status(400).json({ error: "Missing fields" });
@@ -149,42 +125,86 @@ app.post('/v1/generate-key', async (req, res) => {
     const cleanDiscordId = String(discordId).trim();
     const cleanKey = String(key).trim();
     const now = Date.now();
-
-    // Exact 24 Hours validity
     let expTime = Number(expiresAt);
-    if (!expTime || isNaN(expTime) || expTime <= now) {
-        expTime = now + (24 * 60 * 60 * 1000);
-    }
+    if (!expTime || isNaN(expTime) || expTime <= now) expTime = now + (24 * 60 * 60 * 1000);
 
     try {
         await pool.query(`DELETE FROM keys WHERE discord_id = $1`, [cleanDiscordId]);
-
         await pool.query(
             `INSERT INTO keys (key, discord_id, expires_at, created_at) VALUES ($1, $2, $3, $4)`,
             [cleanKey, cleanDiscordId, expTime, now]
         );
-
         return res.json({ success: true, message: "Key created successfully!" });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
 });
 
-// 4. BAN IP
+// 4. HEAVY ADMIN PANEL ENDPOINT (ALL DETAILED CATEGORIES)
+app.get('/v1/admin/stats', async (req, res) => {
+    const { adminSecret } = req.query;
+    if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
+
+    try {
+        const currentTime = Date.now();
+        const activeWindow = 10 * 60 * 1000; // 10 Min threshold for Online status
+
+        const allKeysResult = await pool.query(`SELECT * FROM keys ORDER BY created_at DESC`);
+        const bannedIpsResult = await pool.query(`SELECT * FROM banned_ips`);
+
+        const onlineUsers = [];
+        const offlineUsers = [];
+        const bannedKeys = [];
+
+        allKeysResult.rows.forEach(row => {
+            const userObj = {
+                key: row.key,
+                discordId: row.discord_id,
+                ip: row.bound_ip || "Not Bound Yet",
+                hwid: row.bound_hwid || "Not Bound Yet",
+                expiresAt: Number(row.expires_at),
+                lastSeen: row.last_seen ? Number(row.last_seen) : null,
+                isBanned: row.is_banned
+            };
+
+            if (row.is_banned) {
+                bannedKeys.push(userObj);
+            } else if (row.last_seen && (currentTime - Number(row.last_seen)) <= activeWindow) {
+                onlineUsers.push(userObj);
+            } else {
+                offlineUsers.push(userObj);
+            }
+        });
+
+        return res.json({
+            summary: {
+                totalKeys: allKeysResult.rows.length,
+                onlineCount: onlineUsers.length,
+                offlineCount: offlineUsers.length,
+                bannedKeysCount: bannedKeys.length,
+                bannedIpsCount: bannedIpsResult.rows.length
+            },
+            onlineUsers: onlineUsers,
+            offlineUsers: offlineUsers,
+            bannedKeys: bannedKeys,
+            bannedIps: bannedIpsResult.rows.map(r => r.ip)
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// BAN & UNBAN ENDPOINTS
 app.post('/v1/admin/ban-ip', async (req, res) => {
     const { adminSecret, discordId, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
-
     let targetIp = ip;
-
     try {
         if (!targetIp && discordId) {
             const userRes = await pool.query(`SELECT bound_ip FROM keys WHERE discord_id = $1 LIMIT 1`, [String(discordId).trim()]);
             if (userRes.rows.length > 0) targetIp = userRes.rows[0].bound_ip;
         }
-
         if (!targetIp) return res.status(404).json({ error: "User IP not found!" });
-
         await pool.query(`INSERT INTO banned_ips (ip) VALUES ($1) ON CONFLICT DO NOTHING`, [targetIp]);
         return res.json({ success: true, message: `IP ${targetIp} BANNED!`, bannedIp: targetIp });
     } catch (err) {
@@ -192,11 +212,9 @@ app.post('/v1/admin/ban-ip', async (req, res) => {
     }
 });
 
-// 5. UNBAN IP
 app.post('/v1/admin/unban-ip', async (req, res) => {
     const { adminSecret, ip } = req.body;
     if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
-
     try {
         await pool.query(`DELETE FROM banned_ips WHERE ip = $1`, [ip]);
         return res.json({ success: true, message: `IP ${ip} UNBANNED!` });
@@ -205,27 +223,4 @@ app.post('/v1/admin/unban-ip', async (req, res) => {
     }
 });
 
-// 6. ADMIN STATS
-app.get('/v1/admin/stats', async (req, res) => {
-    const { adminSecret } = req.query;
-    if (adminSecret !== ADMIN_SECRET) return res.status(403).json({ error: "Unauthorized!" });
-
-    try {
-        const totalKeys = await pool.query(`SELECT COUNT(*) FROM keys`);
-        const bannedKeys = await pool.query(`SELECT COUNT(*) FROM keys WHERE is_banned = true`);
-        const bannedIps = await pool.query(`SELECT COUNT(*) FROM banned_ips`);
-
-        return res.json({
-            totalKeys: Number(totalKeys.rows[0].count),
-            bannedKeys: Number(bannedKeys.rows[0].count),
-            onlineUsersCount: 0,
-            onlineUsersList: [],
-            bannedIpsCount: Number(bannedIps.rows[0].count)
-        });
-    } catch (err) {
-        return res.status(500).json({ error: err.message });
-    }
-});
-
 module.exports = app;
-    
